@@ -50,6 +50,9 @@ class TargetPrototypeEnricher(nn.Module):
         if args.top_m < 1:
             raise ValueError("--top_m must be a positive integer")
         self.top_m = args.top_m
+        self.gate_variant = getattr(args, "gate_variant", "full")
+        if self.gate_variant not in ("full", "query_only"):
+            raise ValueError("Unknown gate_variant: {}".format(self.gate_variant))
         self.gamma = getattr(args, "enrich_gamma", None)
         self.residual_gate_mode = getattr(args, "residual_gate", "residual")
         if self.residual_gate_mode not in ("static", "residual"):
@@ -84,6 +87,7 @@ class TargetPrototypeEnricher(nn.Module):
         self.extractor_mode = getattr(args, "extractor_mode", "global,horizontal")
         self.num_parts = getattr(args, "num_parts", 6)
         num_slots = prototype_slot_count(self.extractor_mode, self.num_parts)
+        self.num_slots = num_slots
         self.evidence_slot_indices = evidence_slot_indices(self.extractor_mode, self.num_parts)
         self.requires_target_relative = any(
             mode in self.evidence_slot_indices for mode in TARGET_RELATIVE_MODES
@@ -203,6 +207,20 @@ class TargetPrototypeEnricher(nn.Module):
             projected = projector(selected.float())
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
         return updated
+
+    def _query_only_prototypes(self, normalized_query, host_text_features, space):
+        """Query-derived tokens: identical architecture/parameters, no gallery input.
+        Rank/slot embeddings in the mixer still provide learned positions.
+        """
+        if space == "grab":
+            # Reuse Full GATE proto_to_grab; no dormant evidence projection.
+            source = F.normalize(host_text_features.float(), p=2, dim=-1)
+            token = F.normalize(self.proto_to_grab(source), p=2, dim=-1)
+        else:
+            token = normalized_query
+        return token[:, None, None, :].expand(
+            -1, self.top_m, self.num_slots, -1
+        )
 
     def _context(self, query_features, selected_prototypes, space):
         if space == "grab":
@@ -335,6 +353,30 @@ class TargetPrototypeEnricher(nn.Module):
             return host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
 
     def forward(self, query_features, host_text_features, query_pids, pool_cache, space, grab_text_features=None):
+        if self.gate_variant == "query_only":
+            # Gallery features/PIDs enter the supervised TRAINING loss only.
+            # Inference correction never observes a gallery.
+            normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
+            tokens = self._query_only_prototypes(
+                normalized_query, host_text_features, space
+            )
+            context = self._context(normalized_query, tokens, space)
+            enriched = self._fuse(normalized_query, context, space)
+            losses = self.compute_losses(
+                enriched_query=enriched,
+                retrieval_features=F.normalize(
+                    pool_cache["retrieval_features"].float(), p=2, dim=-1
+                ),
+                query_pids=query_pids.long(),
+                pool_pids=pool_cache["pids"].long(),
+            )
+            return {
+                "enriched_features": enriched,
+                "top_indices": None,
+                "target_enrichment_shift_norm": (enriched - normalized_query)
+                    .norm(dim=-1).mean().detach(),
+                **losses,
+            }
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
         prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
@@ -387,6 +429,13 @@ class TargetPrototypeEnricher(nn.Module):
         }
 
     def enrich_only(self, query_features, host_text_features, pool_cache, space, grab_text_features=None):
+        if self.gate_variant == "query_only":
+            normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
+            tokens = self._query_only_prototypes(
+                normalized_query, host_text_features, space
+            )
+            context = self._context(normalized_query, tokens, space)
+            return self._fuse(normalized_query, context, space)
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
         prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()

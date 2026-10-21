@@ -196,6 +196,9 @@ def get_args():
     ######################## target-aware text enrichment ########################
     parser.add_argument("--target_enrichment", action='store_true',
                         help="enable target-aware prototype text enrichment")
+    parser.add_argument("--gate_variant", choices=("full", "query_only"),
+                        default="full",
+                        help="full GATE or gallery-blind capacity-matched control")
     parser.add_argument("--enrichment_start", type=int, default=1,
                         help="first training epoch that enables target enrichment; earlier epochs train host losses only")
     parser.add_argument("--enrichment_space", type=str, default="global",
@@ -282,6 +285,8 @@ def get_args():
         parser.error("--eval_after_epoch must be a non-negative integer")
     if args.enrichment_start < 1:
         parser.error("--enrichment_start must be a positive integer")
+    if args.gate_variant == "query_only" and not args.target_enrichment:
+        parser.error("--gate_variant query_only requires --target_enrichment")
     if args.freeze_host and not args.target_enrichment:
         parser.error("--freeze_host requires --target_enrichment")
     if args.use_freeze_indices and not args.target_enrichment:

@@ -131,6 +131,11 @@ def _clear_cuda_cache_if_available():
         torch.cuda.empty_cache()
 
 
+from utils.gallery_controls import (
+    shuffle_gallery_evidence, similarity_weighted_qe_scores,
+)
+
+
 class Evaluator:
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader
@@ -730,7 +735,7 @@ class Evaluator:
             ))
         return base_tasks
 
-    def _iter_eval_tasks(self, base_tasks, sims_target):
+    def _iter_eval_tasks(self, base_tasks, sims_target, target_tag="proto"):
         for task_name, task_scores in base_tasks:
             yield task_name, task_scores
 
@@ -744,7 +749,7 @@ class Evaluator:
         for proto_lambda in _prototype_lambdas():
             proto_value = _format_lambda(proto_lambda)
             for base_name, scaled_base_scores in scaled_base_tasks:
-                fused_name = "{}+proto({})".format(base_name, proto_value)
+                fused_name = "{}+{}({})".format(base_name, target_tag, proto_value)
                 if abs(proto_lambda - 1.0) < 1e-12:
                     yield fused_name, sims_target
                 else:
@@ -756,6 +761,21 @@ class Evaluator:
     def eval(self, model, i2t_metric=False, use_target_enrichment=None):
         if use_target_enrichment is None:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
+
+        evidence_control = getattr(self.args, "evidence_control", "none")
+        eval_baseline = getattr(self.args, "eval_baseline", "none")
+        if evidence_control not in ("none", "shuffle"):
+            raise ValueError("Unknown evidence_control: {}".format(evidence_control))
+        if eval_baseline not in ("none", "similarity_qe"):
+            raise ValueError("Unknown eval_baseline: {}".format(eval_baseline))
+        if evidence_control == "shuffle" and not use_target_enrichment:
+            raise ValueError("ShuffledEvidence requires --target_enrichment")
+        if evidence_control == "shuffle" and getattr(self.args, "gate_variant", "full") != "full":
+            raise ValueError("ShuffledEvidence requires a full GATE checkpoint")
+        if eval_baseline == "similarity_qe" and use_target_enrichment:
+            raise ValueError("QE is a separate no-training baseline: use --no_target_enrichment")
+        if eval_baseline == "similarity_qe" and evidence_control != "none":
+            raise ValueError("QE and ShuffledEvidence are independent controls")
 
         self.logger.info("Starting evaluation feature extraction")
         include_grab = not self.args.only_global
@@ -787,7 +807,49 @@ class Evaluator:
 
         base_tasks = self._build_base_tasks(sims_global, sims_grab)
         sims_target = None
+        target_tag = "proto"
+        if eval_baseline == "similarity_qe":
+            target_tag = "qe"
+            rank_space = getattr(self.args, "topm_rank_space", "host_global")
+            space = getattr(self.args, "enrichment_space", "global")
+            if space == "grab":
+                if sims_grab is None:
+                    raise ValueError("GRAB-space QE requires non-global ITSELF features")
+                qe_queries, qe_gallery = grab_qfeats, grab_gfeats
+            elif space == "global":
+                qe_queries, qe_gallery = host_qfeats, host_gfeats
+            else:
+                raise ValueError("QE enrichment_space must be global or grab")
+            if rank_space == "host_global":
+                ranking_scores = sims_global
+            elif rank_space == "retrieval":
+                ranking_scores = sims_grab if space == "grab" else sims_global
+            elif rank_space == "hybrid_global_grab":
+                if sims_grab is None:
+                    raise ValueError("Hybrid Top-M QE requires GRAB features")
+                lam = float(getattr(self.args, "topm_rank_lambda", 0.5))
+                ranking_scores = lam * sims_global + (1.0 - lam) * sims_grab
+            else:
+                raise ValueError("Unsupported topm_rank_space: {}".format(rank_space))
+            top_m = getattr(self.args, "qe_top_m", None)
+            if top_m is None:
+                top_m = getattr(self.args, "top_m", 32)
+            sims_target = similarity_weighted_qe_scores(
+                query_features=qe_queries,
+                gallery_features=qe_gallery,
+                rank_scores=ranking_scores,
+                top_m=top_m,
+                alpha=getattr(self.args, "qe_alpha", 0.5),
+                temperature=getattr(self.args, "qe_temperature", 0.05),
+            )
+            self.logger.info("Computed similarity-weighted QE over full gallery")
         if use_target_enrichment:
+            if evidence_control == "shuffle":
+                target_cache = shuffle_gallery_evidence(
+                    target_cache, seed=getattr(self.args, "evidence_seed", 1)
+                )
+                self.logger.info("Shuffled evidence only (seed=%s); rankings unchanged",
+                                 getattr(self.args, "evidence_seed", 1))
             self.logger.info("Computing target-aware enrichment features")
             target_qfeats, target_qids = self._compute_enriched_text_embedding_from_features(
                 model,
@@ -825,7 +887,7 @@ class Evaluator:
         last_task_log_time = task_start_time
 
         for task_idx, (key, sims) in enumerate(
-            self._iter_eval_tasks(base_tasks, sims_target),
+            self._iter_eval_tasks(base_tasks, sims_target, target_tag=target_tag),
             1,
         ):
             t2i_name = "{}-t2i".format(key)
@@ -873,7 +935,7 @@ class Evaluator:
             if best_row is None or rs[1] > best_row[1]:
                 best_task = key
                 best_row = rs
-            if "+proto(" in key and (
+            if ("+{}(".format(target_tag) in key) and (
                 best_ablation_row is None or rs[1] > best_ablation_row[1]
             ):
                 best_ablation_task = key
@@ -911,7 +973,7 @@ class Evaluator:
         elif best_row is not None:
             top1 = float(best_row[1])
 
-        target_key = "global+proto(1)"
+        target_key = "global+{}(1)".format(target_tag)
         if "global" in rows_by_task and target_key in rows_by_task:
             global_row = rows_by_task["global"]
             target_row = rows_by_task[target_key]
@@ -934,6 +996,16 @@ class Evaluator:
                 target_row[6] - global_row[6]
             )
 
+        eval_metrics["eval/control_evidence"] = evidence_control
+        eval_metrics["eval/control_baseline"] = eval_baseline
+        if evidence_control == "shuffle":
+            eval_metrics["eval/control_seed"] = int(getattr(self.args, "evidence_seed", 1))
+        if eval_baseline == "similarity_qe":
+            eval_metrics["eval/qe_alpha"] = float(getattr(self.args, "qe_alpha", 0.5))
+            eval_metrics["eval/qe_temperature"] = float(getattr(self.args, "qe_temperature", 0.05))
+            qe_top_m = getattr(self.args, "qe_top_m", None)
+            eval_metrics["eval/qe_top_m"] = int(qe_top_m if qe_top_m is not None else
+                                               getattr(self.args, "top_m", 32))
         self.last_metrics = eval_metrics
         self.last_best_task = best_task
 

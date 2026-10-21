@@ -206,6 +206,12 @@ def _ensure_inference_defaults(args, config_file, config_keys=None):
     _set_if_not_present(args, "local_rank", 0)
     _set_if_not_present(args, "only_global", False)
     _set_if_not_present(args, "target_enrichment", False)
+    _set_if_not_present(args, "evidence_control", "none")
+    _set_if_not_present(args, "evidence_seed", 1)
+    _set_if_not_present(args, "eval_baseline", "none")
+    _set_if_not_present(args, "qe_alpha", 0.5)
+    _set_if_not_present(args, "qe_temperature", 0.05)
+    _set_if_not_present(args, "qe_top_m", None)
     _set_if_not_present(args, "enrichment_space", "global")
     _set_if_not_present(args, "pretrain_choice", "ViT-B/16")
     _set_if_not_present(args, "img_size", (384, 128))
@@ -240,6 +246,12 @@ def _apply_cli_overrides(args, cli_args, config_file, checkpoint, eval_dir):
         "only_global",
         "target_enrichment",
         "enrichment_space",
+        "evidence_control",
+        "evidence_seed",
+        "eval_baseline",
+        "qe_alpha",
+        "qe_temperature",
+        "qe_top_m",
     ):
         value = getattr(cli_args, name, None)
         if value is not None:
@@ -446,6 +458,15 @@ def main():
         "source_check": None,
         "device": str(device),
         "results": {},
+        "inference_control": {
+            "gate_variant": getattr(args, "gate_variant", "full"),
+            "evidence_control": args.evidence_control,
+            "evidence_seed": args.evidence_seed,
+            "eval_baseline": args.eval_baseline,
+            "qe_alpha": args.qe_alpha,
+            "qe_temperature": args.qe_temperature,
+            "qe_top_m": args.qe_top_m,
+        },
     }
 
     source_check_metrics = None

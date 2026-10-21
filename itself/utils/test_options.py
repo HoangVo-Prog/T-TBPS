@@ -100,6 +100,20 @@ def get_test_args():
         help="sets CUDA_VISIBLE_DEVICES before torch/model imports",
     )
 
+    # Inference-only controls: intentionally not stored in GATE checkpoints.
+    parser.add_argument("--evidence_control", choices=("none", "shuffle"),
+                        default=None, help="keep or permute cached gallery evidence")
+    parser.add_argument("--evidence_seed", type=int, default=None,
+                        help="fixed seed for one permutation per gallery")
+    parser.add_argument("--eval_baseline", choices=("none", "similarity_qe"),
+                        default=None, help="optional train-free gallery feedback baseline")
+    parser.add_argument("--qe_alpha", type=float, default=None,
+                        help="QE context strength (nonnegative)")
+    parser.add_argument("--qe_temperature", type=float, default=None,
+                        help="QE softmax temperature (positive)")
+    parser.add_argument("--qe_top_m", type=int, default=None,
+                        help="QE evidence count; default host top_m")
+
     parser.add_argument(
         "--output_eval_dir",
         default=None,
