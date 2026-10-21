@@ -1,0 +1,951 @@
+from prettytable import PrettyTable
+import logging
+import re
+import time
+
+import torch
+import torch.nn.functional as F
+
+
+def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
+    if get_mAP:
+        indices = torch.argsort(similarity, dim=1, descending=True)
+    else:
+        _, indices = torch.topk(
+            similarity, k=max_rank, dim=1, largest=True, sorted=True
+        )
+    pred_labels = g_pids[indices.cpu()]
+    matches = pred_labels.eq(q_pids.view(-1, 1))
+
+    all_cmc = matches[:, :max_rank].cumsum(1)
+    all_cmc[all_cmc > 1] = 1
+    all_cmc = all_cmc.float().mean(0) * 100
+
+    if not get_mAP:
+        return all_cmc, indices
+
+    num_rel = matches.sum(1)
+    tmp_cmc = matches.cumsum(1)
+
+    last_rel_rank = (tmp_cmc != num_rel.view(-1, 1)).sum(1) + 1
+    mINP = (num_rel.float() / last_rel_rank.float()).mean() * 100
+
+    rank_positions = torch.arange(
+        1,
+        tmp_cmc.shape[1] + 1,
+        device=tmp_cmc.device,
+        dtype=torch.float32,
+    ).view(1, -1)
+    tmp_cmc = tmp_cmc.float()
+    tmp_cmc.div_(rank_positions)
+    tmp_cmc.mul_(matches)
+    AP = tmp_cmc.sum(1) / num_rel
+    mAP = AP.mean() * 100
+
+    return all_cmc, mAP, mINP, indices
+
+
+def get_metrics(similarity, qids, gids, n_, retur_indices=False):
+    t2i_cmc, t2i_mAP, t2i_mINP, indices = rank(
+        similarity=similarity,
+        q_pids=qids,
+        g_pids=gids,
+        max_rank=10,
+        get_mAP=True,
+    )
+    t2i_cmc, t2i_mAP, t2i_mINP = t2i_cmc.numpy(), t2i_mAP.numpy(), t2i_mINP.numpy()
+    row = [
+        n_,
+        t2i_cmc[0],
+        t2i_cmc[4],
+        t2i_cmc[9],
+        t2i_mAP,
+        t2i_mINP,
+        t2i_cmc[0] + t2i_cmc[4] + t2i_cmc[9],
+    ]
+    if retur_indices:
+        return row, indices
+    return row
+
+
+def _metric_task_name(task):
+    task = str(task).replace("+", "_plus_")
+    task = task.replace("(", "_").replace(")", "")
+    task = task.replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_/-]+", "_", task).strip("_")
+
+
+def _row_to_eval_metrics(row):
+    task = _metric_task_name(row[0])
+    return {
+        f"eval/{task}/R1": float(row[1]),
+        f"eval/{task}/R5": float(row[2]),
+        f"eval/{task}/R10": float(row[3]),
+        f"eval/{task}/mAP": float(row[4]),
+        f"eval/{task}/mINP": float(row[5]),
+        f"eval/{task}/rSum": float(row[6]) if len(row) > 6 else 0.0,
+    }
+
+
+def _rename_metric_row(row, task_name):
+    return [task_name, *row[1:]]
+
+
+def _scale_scores_like(scores, reference, eps=1e-12):
+    score_min = scores.min(dim=1, keepdim=True).values
+    score_max = scores.max(dim=1, keepdim=True).values
+    ref_min = reference.min(dim=1, keepdim=True).values
+    ref_max = reference.max(dim=1, keepdim=True).values
+
+    score_range = (score_max - score_min).clamp_min(eps)
+    ref_range = ref_max - ref_min
+    return (scores - score_min) / score_range * ref_range + ref_min
+
+
+def _global_grab_lambdas():
+    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.68, 0.32]
+
+
+def _prototype_lambdas():
+    return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def _format_lambda(value):
+    if abs(value - round(value)) < 1e-12:
+        return str(int(round(value)))
+    return "{:.2f}".format(value).rstrip("0").rstrip(".")
+
+
+def _scaled_fuse(primary_scores, secondary_scores, primary_weight):
+    scaled_secondary = _scale_scores_like(secondary_scores, primary_scores)
+    return primary_weight * primary_scores + (1.0 - primary_weight) * scaled_secondary
+
+
+def _ablation_lambda_from_key(key):
+    match = re.search(r"\(([-+]?\d*\.?\d+)\)$", str(key))
+    return float(match.group(1)) if match else 0.0
+
+
+def _clear_cuda_cache_if_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class Evaluator:
+    def __init__(self, img_loader, txt_loader, args):
+        self.img_loader = img_loader
+        self.txt_loader = txt_loader
+        self.logger = logging.getLogger("ITSELF.eval")
+        self.args = args
+        self.last_metrics = {}
+        self.last_best_task = None
+        self.progress_log_interval = max(
+            0.0, float(getattr(args, "eval_log_interval", 30.0) or 0.0)
+        )
+
+    def _loader_total_items(self, loader):
+        dataset = getattr(loader, "dataset", None)
+        if dataset is None:
+            return None
+        try:
+            return len(dataset)
+        except TypeError:
+            return None
+
+    def _format_elapsed(self, seconds):
+        seconds = int(max(0.0, seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return "{}h{:02d}m{:02d}s".format(hours, minutes, secs)
+        if minutes > 0:
+            return "{}m{:02d}s".format(minutes, secs)
+        return "{}s".format(secs)
+
+    def _log_loader_progress(
+        self,
+        stage_name,
+        batch_idx,
+        num_batches,
+        processed_items,
+        total_items,
+        start_time,
+        force=False,
+    ):
+        if not force and self.progress_log_interval <= 0:
+            return
+
+        elapsed = self._format_elapsed(time.monotonic() - start_time)
+        parts = ["{} progress".format(stage_name)]
+        if num_batches is not None:
+            parts.append("batch {}/{}".format(batch_idx, num_batches))
+        else:
+            parts.append("batch {}".format(batch_idx))
+
+        if total_items:
+            progress = min(100.0, 100.0 * processed_items / total_items)
+            parts.append(
+                "items {}/{} ({:.1f}%)".format(
+                    processed_items,
+                    total_items,
+                    progress,
+                )
+            )
+        else:
+            parts.append("items {}".format(processed_items))
+
+        parts.append("elapsed {}".format(elapsed))
+        self.logger.info(" | ".join(parts))
+
+    def _encode_loader(self, loader, stage_name, encoder_fn, device):
+        ids = []
+        features = []
+        processed_items = 0
+        total_items = self._loader_total_items(loader)
+        try:
+            num_batches = len(loader)
+        except TypeError:
+            num_batches = None
+
+        self.logger.info(
+            "Starting {}{}".format(
+                stage_name,
+                " for {} items".format(total_items) if total_items else "",
+            )
+        )
+        start_time = time.monotonic()
+        last_log_time = start_time
+
+        for batch_idx, (pid, payload) in enumerate(loader, 1):
+            payload = payload.to(device)
+            with torch.no_grad():
+                feat = encoder_fn(payload).cpu()
+            ids.append(pid.view(-1))
+            features.append(feat)
+            processed_items += int(pid.numel())
+
+            now = time.monotonic()
+            if (
+                batch_idx == 1
+                or (num_batches is not None and batch_idx == num_batches)
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_loader_progress(
+                    stage_name,
+                    batch_idx,
+                    num_batches,
+                    processed_items,
+                    total_items,
+                    start_time,
+                    force=True,
+                )
+                last_log_time = now
+
+        ids = torch.cat(ids, 0)
+        features = torch.cat(features, 0)
+        self.logger.info(
+            "Finished {}: {} items in {}".format(
+                stage_name,
+                processed_items,
+                self._format_elapsed(time.monotonic() - start_time),
+            )
+        )
+        return features.cpu(), ids.cpu()
+
+    def _log_task_progress(self, completed, total_tasks, start_time, force=False):
+        if not force and self.progress_log_interval <= 0:
+            return
+        elapsed = self._format_elapsed(time.monotonic() - start_time)
+        self.logger.info(
+            "Scoring evaluation tasks: {}/{} complete | elapsed {}".format(
+                completed,
+                total_tasks,
+                elapsed,
+            )
+        )
+
+    def _core_model(self, model):
+        return model.module if hasattr(model, "module") else model
+
+    def _cache_chunk_to_cpu(self, cache):
+        return {key: value.detach().cpu() for key, value in cache.items()}
+
+    def _finalize_target_cache(self, model, gids, cache_chunks, device):
+        target_cache = {}
+        for key in cache_chunks[0].keys():
+            target_cache[key] = torch.cat(
+                [chunk[key] for chunk in cache_chunks],
+                dim=0,
+            ).to(device)
+        target_cache["pids"] = gids.to(device)
+        core_model = self._core_model(model)
+        if hasattr(core_model, "finalize_target_cache"):
+            target_cache = core_model.finalize_target_cache(target_cache)
+        return target_cache
+
+    def _branch_stage_name(self, modality, include_grab, include_target_cache=False):
+        branches = "global/GRAB" if include_grab else "global"
+        stage_name = "{} {} embeddings".format(branches, modality)
+        if include_target_cache:
+            stage_name += " and target gallery cache"
+        return stage_name
+
+    def _compute_text_branches(self, model, include_grab=False):
+        model = model.eval()
+        device = next(model.parameters()).device
+        core_model = self._core_model(model)
+
+        stage_name = self._branch_stage_name("text", include_grab)
+        qids, host_feats, grab_feats, batch_sizes = [], [], [], []
+        processed_items = 0
+        total_items = self._loader_total_items(self.txt_loader)
+        try:
+            num_batches = len(self.txt_loader)
+        except TypeError:
+            num_batches = None
+
+        self.logger.info(
+            "Starting {}{}".format(
+                stage_name,
+                " for {} items".format(total_items) if total_items else "",
+            )
+        )
+        start_time = time.monotonic()
+        last_log_time = start_time
+
+        for batch_idx, (pid, caption) in enumerate(self.txt_loader, 1):
+            caption = caption.to(device)
+            with torch.no_grad():
+                if hasattr(core_model, "encode_eval_text_bundle"):
+                    bundle = core_model.encode_eval_text_bundle(
+                        caption,
+                        include_grab=include_grab,
+                    )
+                    host_feat = bundle["host_features"].cpu()
+                    grab_feat = (
+                        bundle["grab_features"].cpu() if include_grab else None
+                    )
+                else:
+                    host_feat = model.encode_text(caption).cpu()
+                    grab_feat = (
+                        model.encode_text_grab(caption).cpu()
+                        if include_grab
+                        else None
+                    )
+            flat_pid = pid.view(-1)
+            qids.append(flat_pid)
+            host_feats.append(host_feat)
+            if include_grab:
+                grab_feats.append(grab_feat)
+            batch_sizes.append(int(flat_pid.numel()))
+            processed_items += int(pid.numel())
+
+            now = time.monotonic()
+            if (
+                batch_idx == 1
+                or (num_batches is not None and batch_idx == num_batches)
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_loader_progress(
+                    stage_name,
+                    batch_idx,
+                    num_batches,
+                    processed_items,
+                    total_items,
+                    start_time,
+                    force=True,
+                )
+                last_log_time = now
+
+        qids = torch.cat(qids, 0).cpu()
+        host_feats = torch.cat(host_feats, 0).cpu()
+        if include_grab:
+            grab_feats = torch.cat(grab_feats, 0).cpu()
+        else:
+            grab_feats = None
+        self.logger.info(
+            "Finished {}: {} items in {}".format(
+                stage_name,
+                processed_items,
+                self._format_elapsed(time.monotonic() - start_time),
+            )
+        )
+        return host_feats, grab_feats, qids, batch_sizes
+
+    def _compute_image_branches(
+        self,
+        model,
+        include_grab=False,
+        include_target_cache=False,
+    ):
+        model = model.eval()
+        device = next(model.parameters()).device
+        core_model = self._core_model(model)
+
+        stage_name = self._branch_stage_name(
+            "image",
+            include_grab,
+            include_target_cache,
+        )
+        gids, host_feats, grab_feats, cache_chunks = [], [], [], []
+        processed_items = 0
+        total_items = self._loader_total_items(self.img_loader)
+        try:
+            num_batches = len(self.img_loader)
+        except TypeError:
+            num_batches = None
+
+        self.logger.info(
+            "Starting {}{}".format(
+                stage_name,
+                " for {} items".format(total_items) if total_items else "",
+            )
+        )
+        start_time = time.monotonic()
+        last_log_time = start_time
+
+        for batch_idx, (pid, img) in enumerate(self.img_loader, 1):
+            img = img.to(device)
+            with torch.no_grad():
+                if hasattr(core_model, "encode_eval_image_bundle"):
+                    bundle = core_model.encode_eval_image_bundle(
+                        img,
+                        include_grab=include_grab,
+                        cache_target=include_target_cache,
+                    )
+                    host_feat = bundle["host_features"].cpu()
+                    grab_feat = (
+                        bundle["grab_features"].cpu() if include_grab else None
+                    )
+                    cache = bundle.get("target_cache")
+                else:
+                    host_feat = model.encode_image(img).cpu()
+                    grab_feat = (
+                        model.encode_image_grab(img).cpu()
+                        if include_grab
+                        else None
+                    )
+                    cache = (
+                        model.encode_target_image_cache(img)
+                        if include_target_cache
+                        else None
+                    )
+            gids.append(pid.view(-1))
+            host_feats.append(host_feat)
+            if include_grab:
+                grab_feats.append(grab_feat)
+            if include_target_cache:
+                cache_chunks.append(self._cache_chunk_to_cpu(cache))
+            processed_items += int(pid.numel())
+
+            now = time.monotonic()
+            if (
+                batch_idx == 1
+                or (num_batches is not None and batch_idx == num_batches)
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_loader_progress(
+                    stage_name,
+                    batch_idx,
+                    num_batches,
+                    processed_items,
+                    total_items,
+                    start_time,
+                    force=True,
+                )
+                last_log_time = now
+
+        gids = torch.cat(gids, 0).cpu()
+        host_feats = torch.cat(host_feats, 0).cpu()
+        if include_grab:
+            grab_feats = torch.cat(grab_feats, 0).cpu()
+        else:
+            grab_feats = None
+        target_cache = None
+        if include_target_cache:
+            target_cache = self._finalize_target_cache(
+                model,
+                gids,
+                cache_chunks,
+                device,
+            )
+        self.logger.info(
+            "Finished {}: {} items in {}".format(
+                stage_name,
+                processed_items,
+                self._format_elapsed(time.monotonic() - start_time),
+            )
+        )
+        return host_feats, grab_feats, gids, target_cache
+
+    def _compute_embedding(self, model):
+        qfeats, _, qids, _ = self._compute_text_branches(model, include_grab=False)
+        gfeats, _, gids, _ = self._compute_image_branches(model, include_grab=False)
+        return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
+
+    def _compute_embedding_grab(self, model):
+        _, qfeats, qids, _ = self._compute_text_branches(model, include_grab=True)
+        _, gfeats, gids, _ = self._compute_image_branches(model, include_grab=True)
+        return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
+
+    def _compute_target_gallery_cache(self, model):
+        _, _, gids, target_cache = self._compute_image_branches(
+            model,
+            include_grab=False,
+            include_target_cache=True,
+        )
+        return target_cache, gids.cpu()
+
+    def _compute_enriched_text_embedding(self, model, target_cache):
+        model = model.eval()
+        device = next(model.parameters()).device
+
+        qids, qfeats = [], []
+        processed_items = 0
+        total_items = self._loader_total_items(self.txt_loader)
+        try:
+            num_batches = len(self.txt_loader)
+        except TypeError:
+            num_batches = None
+
+        self.logger.info(
+            "Starting enriched text embeddings{}".format(
+                " for {} items".format(total_items) if total_items else ""
+            )
+        )
+        start_time = time.monotonic()
+        last_log_time = start_time
+
+        for batch_idx, (pid, caption) in enumerate(self.txt_loader, 1):
+            caption = caption.to(device)
+            with torch.no_grad():
+                host_text_feat = model.encode_text(caption)
+                grab_text_feat = None
+                if (
+                    self.args.enrichment_space == "grab"
+                    or getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+                ):
+                    grab_text_feat = model.encode_text_grab(caption)
+                if self.args.enrichment_space == "grab":
+                    query_feat = grab_text_feat
+                else:
+                    query_feat = host_text_feat
+                text_feat = model.enrich_text_features(
+                    query_feat,
+                    host_text_feat,
+                    target_cache,
+                    grab_text_features=grab_text_feat,
+                ).cpu()
+            qids.append(pid.view(-1))
+            qfeats.append(text_feat)
+            processed_items += int(pid.numel())
+
+            now = time.monotonic()
+            if (
+                batch_idx == 1
+                or (num_batches is not None and batch_idx == num_batches)
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_loader_progress(
+                    "enriched text embeddings",
+                    batch_idx,
+                    num_batches,
+                    processed_items,
+                    total_items,
+                    start_time,
+                    force=True,
+                )
+                last_log_time = now
+
+        qids = torch.cat(qids, 0)
+        qfeats = torch.cat(qfeats, 0)
+        self.logger.info(
+            "Finished enriched text embeddings: {} items in {}".format(
+                processed_items,
+                self._format_elapsed(time.monotonic() - start_time),
+            )
+        )
+        return qfeats.cpu(), qids.cpu()
+
+    def _run_enrich_text_features(
+        self,
+        model,
+        target_cache,
+        host_text_feat,
+        grab_text_feat,
+    ):
+        query_feat = grab_text_feat if self.args.enrichment_space == "grab" else host_text_feat
+        with torch.no_grad():
+            return model.enrich_text_features(
+                query_feat,
+                host_text_feat,
+                target_cache,
+                grab_text_features=grab_text_feat,
+            ).cpu()
+
+    def _enrich_text_features_adaptive(
+        self,
+        model,
+        target_cache,
+        host_text_feat,
+        grab_text_feat,
+    ):
+        try:
+            return self._run_enrich_text_features(
+                model,
+                target_cache,
+                host_text_feat,
+                grab_text_feat,
+            )
+        except torch.cuda.OutOfMemoryError as error:
+            batch_size = host_text_feat.shape[0]
+            if batch_size <= 1:
+                raise
+            error.__traceback__ = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            split = batch_size // 2
+            self.logger.warning(
+                "CUDA OOM during enriched text evaluation for batch size {}; "
+                "retrying as {} + {}".format(batch_size, split, batch_size - split)
+            )
+            left_grab = grab_text_feat[:split] if grab_text_feat is not None else None
+            right_grab = grab_text_feat[split:] if grab_text_feat is not None else None
+            left = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat[:split],
+                left_grab,
+            )
+            right = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat[split:],
+                right_grab,
+            )
+            return torch.cat([left, right], dim=0)
+
+    def _compute_enriched_text_embedding_from_features(
+        self,
+        model,
+        target_cache,
+        host_text_features,
+        qids,
+        batch_sizes,
+        grab_text_features=None,
+    ):
+        model = model.eval()
+        device = next(model.parameters()).device
+
+        needs_grab = (
+            self.args.enrichment_space == "grab"
+            or getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+        )
+        stage_name = "enriched text embeddings from cached features"
+        qfeats = []
+        processed_items = 0
+        total_items = int(sum(batch_sizes))
+        num_batches = len(batch_sizes)
+        self.logger.info(
+            "Starting {}{}".format(
+                stage_name,
+                " for {} items".format(total_items) if total_items else "",
+            )
+        )
+        start_time = time.monotonic()
+        last_log_time = start_time
+
+        offset = 0
+        for batch_idx, batch_size in enumerate(batch_sizes, 1):
+            end = offset + batch_size
+            host_text_feat = host_text_features[offset:end].to(device)
+            grab_text_feat = None
+            if needs_grab:
+                if grab_text_features is None:
+                    raise ValueError("Target enrichment requires cached GRAB text features")
+                grab_text_feat = grab_text_features[offset:end].to(device)
+            text_feat = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat,
+                grab_text_feat,
+            )
+            qfeats.append(text_feat)
+            processed_items += int(batch_size)
+            offset = end
+
+            now = time.monotonic()
+            if (
+                batch_idx == 1
+                or batch_idx == num_batches
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_loader_progress(
+                    stage_name,
+                    batch_idx,
+                    num_batches,
+                    processed_items,
+                    total_items,
+                    start_time,
+                    force=True,
+                )
+                last_log_time = now
+
+        self.logger.info(
+            "Finished {}: {} items in {}".format(
+                stage_name,
+                processed_items,
+                self._format_elapsed(time.monotonic() - start_time),
+            )
+        )
+        return torch.cat(qfeats, 0).cpu(), qids.cpu()
+
+    def _build_base_tasks(self, sims_global, sims_grab):
+        base_tasks = [("global", sims_global)]
+        if self.args.only_global:
+            return base_tasks
+
+        base_tasks.append(("grab", sims_grab))
+        scaled_grab = _scale_scores_like(sims_grab, sims_global)
+        for lambda_value in _global_grab_lambdas():
+            alpha = _format_lambda(lambda_value)
+            base_tasks.append((
+                "global+grab({})".format(alpha),
+                lambda_value * sims_global + (1.0 - lambda_value) * scaled_grab,
+            ))
+        return base_tasks
+
+    def _iter_eval_tasks(self, base_tasks, sims_target):
+        for task_name, task_scores in base_tasks:
+            yield task_name, task_scores
+
+        if sims_target is None:
+            return
+
+        scaled_base_tasks = [
+            (base_name, _scale_scores_like(base_scores, sims_target))
+            for base_name, base_scores in base_tasks
+        ]
+        for proto_lambda in _prototype_lambdas():
+            proto_value = _format_lambda(proto_lambda)
+            for base_name, scaled_base_scores in scaled_base_tasks:
+                fused_name = "{}+proto({})".format(base_name, proto_value)
+                if abs(proto_lambda - 1.0) < 1e-12:
+                    yield fused_name, sims_target
+                else:
+                    yield fused_name, (
+                        (1.0 - proto_lambda) * scaled_base_scores
+                        + proto_lambda * sims_target
+                    )
+
+    def eval(self, model, i2t_metric=False, use_target_enrichment=None):
+        if use_target_enrichment is None:
+            use_target_enrichment = getattr(self.args, "target_enrichment", False)
+
+        self.logger.info("Starting evaluation feature extraction")
+        include_grab = not self.args.only_global
+        host_qfeats, grab_qfeats, qids, text_batch_sizes = self._compute_text_branches(
+            model,
+            include_grab=include_grab,
+        )
+        host_gfeats, grab_gfeats, gids, target_cache = self._compute_image_branches(
+            model,
+            include_grab=include_grab,
+            include_target_cache=use_target_enrichment,
+        )
+        qfeats = F.normalize(host_qfeats, p=2, dim=1)
+        gfeats = F.normalize(host_gfeats, p=2, dim=1)
+        sims_global = qfeats @ gfeats.t()
+        self.logger.info(
+            "Global similarity matrix ready: {} queries x {} gallery".format(
+                qfeats.shape[0],
+                gfeats.shape[0],
+            )
+        )
+
+        sims_grab = None
+        if include_grab:
+            vq_feats = F.normalize(grab_qfeats, p=2, dim=1)
+            vg_feats = F.normalize(grab_gfeats, p=2, dim=1)
+            sims_grab = vq_feats @ vg_feats.t()
+            self.logger.info("GRAB similarity matrix ready")
+
+        base_tasks = self._build_base_tasks(sims_global, sims_grab)
+        sims_target = None
+        if use_target_enrichment:
+            self.logger.info("Computing target-aware enrichment features")
+            target_qfeats, target_qids = self._compute_enriched_text_embedding_from_features(
+                model,
+                target_cache,
+                host_qfeats,
+                qids,
+                text_batch_sizes,
+                grab_text_features=grab_qfeats,
+            )
+            target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
+            target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
+            sims_target = target_qfeats @ target_gfeats.t()
+            qids = target_qids
+            del target_cache
+            _clear_cuda_cache_if_available()
+            self.logger.info("Released target gallery cache from GPU memory")
+            self.logger.info("Target-aware similarity matrix ready")
+
+        table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP", "rSum"])
+
+        top1 = 0
+        eval_metrics = {}
+        rows_by_task = {}
+        best_task = None
+        best_row = None
+        best_ablation_task = None
+        best_ablation_row = None
+        t2i_metric_cache = {}
+        i2t_metric_cache = {}
+        total_eval_tasks = len(base_tasks)
+        if sims_target is not None:
+            total_eval_tasks *= 1 + len(_prototype_lambdas())
+        self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
+        task_start_time = time.monotonic()
+        last_task_log_time = task_start_time
+
+        for task_idx, (key, sims) in enumerate(
+            self._iter_eval_tasks(base_tasks, sims_target),
+            1,
+        ):
+            t2i_name = "{}-t2i".format(key)
+            cache_key = id(sims) if sims_target is not None and sims is sims_target else None
+            if cache_key is not None and cache_key in t2i_metric_cache:
+                rs = _rename_metric_row(t2i_metric_cache[cache_key], t2i_name)
+            else:
+                rs = get_metrics(sims, qids, gids, t2i_name, False)
+                if cache_key is not None:
+                    t2i_metric_cache[cache_key] = rs
+            table.add_row(rs)
+            rows_by_task[key] = rs
+            eval_metrics.update(_row_to_eval_metrics(rs))
+            if i2t_metric:
+                i2t_name = "{}-i2t".format(key)
+                if cache_key is not None and cache_key in i2t_metric_cache:
+                    i2t_row = _rename_metric_row(i2t_metric_cache[cache_key], i2t_name)
+                else:
+                    i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(
+                        similarity=sims.t(),
+                        q_pids=gids,
+                        g_pids=qids,
+                        max_rank=10,
+                        get_mAP=True,
+                    )
+                    i2t_cmc, i2t_mAP, i2t_mINP = (
+                        i2t_cmc.numpy(),
+                        i2t_mAP.numpy(),
+                        i2t_mINP.numpy(),
+                    )
+                    i2t_row = [
+                        i2t_name,
+                        i2t_cmc[0],
+                        i2t_cmc[4],
+                        i2t_cmc[9],
+                        i2t_mAP,
+                        i2t_mINP,
+                        i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9],
+                    ]
+                    if cache_key is not None:
+                        i2t_metric_cache[cache_key] = i2t_row
+                table.add_row(i2t_row)
+                eval_metrics.update(_row_to_eval_metrics(i2t_row))
+
+            if best_row is None or rs[1] > best_row[1]:
+                best_task = key
+                best_row = rs
+            if "+proto(" in key and (
+                best_ablation_row is None or rs[1] > best_ablation_row[1]
+            ):
+                best_ablation_task = key
+                best_ablation_row = rs
+
+            now = time.monotonic()
+            if (
+                task_idx == 1
+                or task_idx == total_eval_tasks
+                or (
+                    self.progress_log_interval > 0
+                    and now - last_task_log_time >= self.progress_log_interval
+                )
+            ):
+                self._log_task_progress(
+                    task_idx,
+                    total_eval_tasks,
+                    task_start_time,
+                    force=True,
+                )
+                last_task_log_time = now
+
+        if best_ablation_row is not None:
+            top1 = float(best_ablation_row[1])
+            best_task = best_ablation_task
+            eval_metrics["eval/ablation_best_R1"] = float(best_ablation_row[1])
+            eval_metrics["eval/ablation_best_R5"] = float(best_ablation_row[2])
+            eval_metrics["eval/ablation_best_R10"] = float(best_ablation_row[3])
+            eval_metrics["eval/ablation_best_mAP"] = float(best_ablation_row[4])
+            eval_metrics["eval/ablation_best_mINP"] = float(best_ablation_row[5])
+            eval_metrics["eval/ablation_best_rSum"] = float(best_ablation_row[6])
+            eval_metrics["eval/ablation_best_lambda"] = _ablation_lambda_from_key(
+                best_ablation_task
+            )
+        elif best_row is not None:
+            top1 = float(best_row[1])
+
+        target_key = "global+proto(1)"
+        if "global" in rows_by_task and target_key in rows_by_task:
+            global_row = rows_by_task["global"]
+            target_row = rows_by_task[target_key]
+            eval_metrics["eval/delta_R1_target_vs_global"] = float(
+                target_row[1] - global_row[1]
+            )
+            eval_metrics["eval/delta_R5_target_vs_global"] = float(
+                target_row[2] - global_row[2]
+            )
+            eval_metrics["eval/delta_R10_target_vs_global"] = float(
+                target_row[3] - global_row[3]
+            )
+            eval_metrics["eval/delta_mAP_target_vs_global"] = float(
+                target_row[4] - global_row[4]
+            )
+            eval_metrics["eval/delta_mINP_target_vs_global"] = float(
+                target_row[5] - global_row[5]
+            )
+            eval_metrics["eval/delta_rSum_target_vs_global"] = float(
+                target_row[6] - global_row[6]
+            )
+
+        self.last_metrics = eval_metrics
+        self.last_best_task = best_task
+
+        table.custom_format["R1"] = lambda f, v: "{:.2f}".format(v)
+        table.custom_format["R5"] = lambda f, v: "{:.2f}".format(v)
+        table.custom_format["R10"] = lambda f, v: "{:.2f}".format(v)
+        table.custom_format["mAP"] = lambda f, v: "{:.2f}".format(v)
+        table.custom_format["mINP"] = lambda f, v: "{:.2f}".format(v)
+        table.custom_format["rSum"] = lambda f, v: "{:.2f}".format(v)
+        self.logger.info("\n" + str(table))
+        self.logger.info("\n" + "best R1 = " + str(top1))
+        if best_task is not None:
+            self.logger.info("best R1 row = {}".format(best_task))
+
+        return top1
