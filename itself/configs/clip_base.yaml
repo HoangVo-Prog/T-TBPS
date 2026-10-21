@@ -10,7 +10,7 @@ delete_checkpoints_after_run: false
 deterministic: true
 deterministic_warn_only: false
 distributed: false
-enrich_gamma: 0.3
+enrich_gamma: 0.1
 enrichment_space: global
 enrichment_start: 1
 eval_after_epoch: 0
@@ -20,14 +20,12 @@ evidence_token_budget: 0
 extractor_mode: global
 finetune: ''
 finetune_clip: ''
-freeze_host: false
+freeze_host: true
 gamma: 0.1
 img_aug: true
 img_size: !!python/tuple
 - 384
 - 128
-lambda1_weight: 0.5
-lambda2_weight: 3.5
 lambda_host: 1.0
 lambda_ret: 0.5
 layer_index: -1
@@ -57,7 +55,7 @@ num_parts: 24
 num_workers: 4
 only_global: true
 optimizer: Adam
-output_dir: ITSELF/RSTPReid/20260622_005955_ITSELF_tal+cid
+output_dir: CLIP/RSTPReid
 pnp_text_only: true
 power: 0.9
 pretrain: ''
@@ -80,10 +78,9 @@ target_relative_cluster_method: kmeans
 target_relative_num_clusters: 16
 target_relative_space: host_global
 tau: 0.015
-temperature: 0.02
 test_batch_size: 512
 text_length: 77
-top_m: 64
+top_m: 32
 topk_type: mean
 topm_rank_lambda: 0.5
 topm_rank_space: host_global
@@ -93,8 +90,7 @@ use_freeze_indices: true
 use_host_loss: false
 use_wandb: true
 val_dataset: test
-vocab_size: 49408
-wandb_project: transductive_clip_rstp
+wandb_project: transductive-clip-rstp
 warmup_epochs: 5
 warmup_factor: 0.1
 warmup_method: linear
