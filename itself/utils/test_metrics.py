@@ -809,8 +809,7 @@ class Evaluator:
             sims_grab = vq_feats @ vg_feats.t()
             self.logger.info("GRAB similarity matrix ready")
 
-        base_tasks = (self._build_base_tasks(sims_global, sims_grab)
-                      if eval_baseline != "uniform_prf" else [])
+        base_tasks = self._build_base_tasks(sims_global, sims_grab)
         sims_target = None
         target_tag = "proto"
         if eval_baseline == "similarity_qe":
@@ -849,6 +848,7 @@ class Evaluator:
             )
             self.logger.info("Computed similarity-weighted QE over full gallery")
         if eval_baseline == "uniform_prf":
+            target_tag = "uniform_prf"
             space = getattr(self.args, "enrichment_space", "global")
             rank_space = getattr(self.args, "topm_rank_space", "host_global")
             if space == "global":
@@ -874,9 +874,8 @@ class Evaluator:
             else:
                 raise ValueError("Unsupported topm_rank_space: {}".format(rank_space))
 
-            # Pure PRF: chosen-space frozen baseline and full-gallery refined
-            # scores only; never a score-fusion/lambda sweep.
-            base_tasks = [(space, baseline_scores)]
+            # Retain the complete Main GATE baseline task grid. PRF remains
+            # frozen/uniform; only the final score interpolation is swept.
             sims_target = uniform_prf_scores(
                 query_features=prf_queries,
                 gallery_features=prf_gallery,
@@ -921,15 +920,12 @@ class Evaluator:
         best_ablation_row = None
         t2i_metric_cache = {}
         i2t_metric_cache = {}
-        if eval_baseline == "uniform_prf":
-            prf_task = "{}+uniform_prf".format(space)
-            eval_tasks = iter(base_tasks + [(prf_task, sims_target)])
-            total_eval_tasks = 2
-        else:
-            eval_tasks = self._iter_eval_tasks(base_tasks, sims_target, target_tag=target_tag)
-            total_eval_tasks = len(base_tasks)
-            if sims_target is not None:
-                total_eval_tasks *= 1 + len(_prototype_lambdas())
+        eval_tasks = self._iter_eval_tasks(
+            base_tasks, sims_target, target_tag=target_tag,
+        )
+        total_eval_tasks = len(base_tasks)
+        if sims_target is not None:
+            total_eval_tasks *= 1 + len(_prototype_lambdas())
         self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
@@ -1019,13 +1015,11 @@ class Evaluator:
             top1 = float(best_row[1])
 
         if eval_baseline == "uniform_prf":
-            # Report the actual PRF outcome, even when frozen baseline wins.
-            prf_row = rows_by_task[prf_task]
-            best_task = prf_task
-            top1 = float(prf_row[1])
+            # Lambda=1 is pure PRF, independent of the best fused task.
+            pure_row = rows_by_task["global+uniform_prf(1)"]
             for name, index in (("R1", 1), ("R5", 2), ("R10", 3),
                                 ("mAP", 4), ("mINP", 5)):
-                eval_metrics["eval/prf_{}".format(name)] = float(prf_row[index])
+                eval_metrics["eval/prf_{}".format(name)] = float(pure_row[index])
 
         target_key = "global+{}(1)".format(target_tag)
         if "global" in rows_by_task and target_key in rows_by_task:

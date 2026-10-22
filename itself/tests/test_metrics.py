@@ -269,9 +269,9 @@ def _legacy_full_table(module, img_loader, txt_loader, args, model):
 
 
 class UniformPRFEvaluatorTests(unittest.TestCase):
-    def test_reports_prf_even_when_baseline_wins_without_fusion(self):
+    def test_global_lambda_sweep_and_raw_prf_are_separate(self):
         _ensure_prettytable_importable()
-        from utils.test_metrics import Evaluator
+        from utils.test_metrics import Evaluator, _prototype_lambdas, _format_lambda
 
         q = torch.tensor([[1., 0.]])
         g = torch.tensor([[1., 0.]] + [[-0.4, 0.9165151]] * 9)
@@ -288,17 +288,23 @@ class UniformPRFEvaluatorTests(unittest.TestCase):
             q, None, qids, [1])
         evaluator._compute_image_branches = lambda model, include_grab, include_target_cache: (
             g, None, gids, None)
-        result = evaluator.eval(None)
+        top1 = evaluator.eval(None)
+        metrics = evaluator.last_metrics
+        self.assertTrue(evaluator.last_best_task.startswith("global+uniform_prf("))
+        self.assertEqual(top1, metrics["eval/ablation_best_R1"])
+        self.assertIn("eval/ablation_best_lambda", metrics)
+        self.assertGreater(metrics["eval/global-t2i/R1"], metrics["eval/prf_R1"])
+        self.assertEqual(len([k for k in metrics if k.endswith("/mAP")]), 12)
+        self.assertEqual(len(_prototype_lambdas()), 11)
+        for lam in _prototype_lambdas():
+            key = "eval/global_plus_uniform_prf_{0}-t2i/mAP".format(
+                _format_lambda(lam).replace(".", "p")
+            )
+            self.assertIn(key, metrics)
+        self.assertEqual(metrics["eval/prf_mAP"],
+                         metrics["eval/global_plus_uniform_prf_1-t2i/mAP"])
 
-        self.assertEqual(evaluator.last_best_task, "global+uniform_prf")
-        self.assertEqual(result, evaluator.last_metrics["eval/prf_R1"])
-        self.assertGreater(evaluator.last_metrics["eval/global-t2i/R1"], result)
-        self.assertNotIn("eval/ablation_best_lambda", evaluator.last_metrics)
-        self.assertEqual(
-            len([k for k in evaluator.last_metrics if k.endswith("/mAP")]), 2
-        )
-
-    def test_grab_hybrid_ranking_and_direct_grab_output(self):
+    def test_grab_hybrid_restores_full_base_task_grid(self):
         _ensure_prettytable_importable()
         from utils.test_metrics import Evaluator
 
@@ -320,10 +326,13 @@ class UniformPRFEvaluatorTests(unittest.TestCase):
         evaluator._compute_image_branches = lambda model, include_grab, include_target_cache: (
             host_g, grab_g, gids, None)
         top1 = evaluator.eval(None)
-        self.assertEqual(evaluator.last_best_task, "grab+uniform_prf")
-        self.assertEqual(top1, evaluator.last_metrics["eval/prf_R1"])
-        self.assertLess(top1, evaluator.last_metrics["eval/grab-t2i/R1"])
-        self.assertNotIn("eval/ablation_best_lambda", evaluator.last_metrics)
+        metrics = evaluator.last_metrics
+        self.assertIn("+uniform_prf(", evaluator.last_best_task)
+        self.assertEqual(top1, metrics["eval/ablation_best_R1"])
+        self.assertLess(metrics["eval/prf_R1"], metrics["eval/grab-t2i/R1"])
+        self.assertEqual(len([k for k in metrics if k.endswith("/mAP")]), 156)
+        self.assertEqual(metrics["eval/prf_mAP"],
+                         metrics["eval/global_plus_uniform_prf_1-t2i/mAP"])
 
 
 class RetrievalMetricTests(unittest.TestCase):

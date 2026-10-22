@@ -8,7 +8,7 @@ This patch adds four **separate** controls. It does **not** change the default f
 | **V1 QueryOnly** | `--gate_variant query_only` during training | **Yes** | Same weights/parameter shapes, supervision, and QCRS path but no gallery in the query correction |
 | **V2 ShuffledEvidence** | `--evidence_control shuffle --evidence_seed 11` in `test.py` | **No** | Correct correspondence of selected candidates to evidence |
 | **V3 Similarity-Weighted QE** | `--eval_baseline similarity_qe` in `test.py` | **No** | Simple rank/similarity-based gallery feedback |
-| **V4 Uniform Rocchio PRF** | `--eval_baseline uniform_prf` in `test.py` | **No** | Equal-weight Top-K gallery evidence without a score-fusion sweep |
+| **V4 Uniform Rocchio PRF** | `--eval_baseline uniform_prf` in `test.py` | **No** | Equal-weight Top-K PRF; same lambda-fusion grid as Main GATE |
 
 ## Requirements / source of truth
 
@@ -103,33 +103,58 @@ For ITSELF, use its frozen host config/checkpoint, with `--enrichment_space grab
 
 `--qe_alpha`, `--qe_temperature`, `--qe_top_m` are explicit hyperparameters; report their values and select them under the same experimental policy as Full GATE. `test.py --target_enrichment` and `--eval_baseline similarity_qe` cannot be combined.
 
-### V4: Uniform Rocchio PRF — independent frozen-host control
+### V4: Uniform Rocchio PRF — training-free feedback with GATE-style fusion
 
-V4 uses only **original frozen BASE host features**, not GATE weights or a trained query mixer. For normalized query `q` and normalized gallery embeddings `g`, choose Top-K indices using the configured initial `topm_rank_space`, compute `c_K = mean(g[TopK])` (uniform weighting), and rank the **entire gallery** with `normalize(q + beta * c_K) @ g.T`. Defaults are `--prf_top_k 64` and `--prf_beta 0.5`. No labels, softmax, QE temperature, learned parameters, score scaling, or final fusion lambda are used.
+Use the **original frozen BASE host checkpoint** (never the trained GATE
+checkpoint). Given normalized frozen text query `q` and gallery `g`, retrieve
+Top-K according to existing `topm_rank_space`; compute uniform mean
+`c_K = (1/K) * sum(g[TopK])`; then evaluate the full gallery using
+`S_PRF = normalize(q + beta*c_K) @ g.T`. PRF itself uses no identity labels,
+learned weights, softmax/temperature, or query training.
 
-**V3 versus V4:** V3 weights candidates with softmax similarity and evaluates QE inside the existing GATE-like lambda-fusion sweep. V4 gives every selected candidate exactly equal weight and reports the **direct, unfused PRF similarity ranking**, even if its R@1 is worse than BASE. In V4's output, `best_task` always names `global+uniform_prf` or `grab+uniform_prf`; `best_R1` is the PRF R@1 rather than the best of BASE and PRF. No `eval/ablation_best_lambda` exists.
+The **evaluation-only** interpolation exactly reuses Main GATE's existing
+`_iter_eval_tasks()` / `_prototype_lambdas()` / `_scale_scores_like()`:
 
-**CLIP (original frozen BASE checkpoint only; NOT a GATE checkpoint):**
+`S(lambda) = (1-lambda) * scale(S_BASE to S_PRF range) + lambda * S_PRF`
+
+`lambda = 0, 0.1, ..., 1`. Defaults: `--prf_top_k 64 --prf_beta 0.5`.
+No PRF K/beta sweep, no extra trainable parameters. V3 remains similarity-weighted;
+V4 uses **equal-weight** Top-K gallery embeddings, but both get the same
+final lambda evaluation policy as Main GATE.
+
+**CLIP example (original frozen BASE checkpoint):**
 
 ```bash
 python test.py \
-  --run_dir /path/to/clip_base_run \
-  --checkpoint /path/to/original_frozen_clip.pth \
-  --root_dir /path/to/tbps-benchmark/benchmark \
-  --source_domain ICFG-PEDES \
-  --target_domain ICFG-PEDES \
-  --no_target_enrichment \
-  --only_global \
-  --eval_baseline uniform_prf \
-  --prf_top_k 64 \
-  --prf_beta 0.5 \
-  --enrichment_space global \
-  --save_json --output_eval_dir /runs/eval/uniform_prf_icfg
+  --run_dir /runs/clip_base_icfg \
+  --checkpoint /checkpoints/original_frozen_clip_base.pth \
+  --root_dir /data/tbps-benchmark/benchmark \
+  --source_domain ICFG-PEDES --target_domain ICFG-PEDES \
+  --no_target_enrichment --only_global --enrichment_space global \
+  --eval_baseline uniform_prf --prf_top_k 64 --prf_beta 0.5 \
+  --save_json --output_eval_dir /runs/eval/v4_sweep_icfg
 ```
 
-For ITSELF, pass the **original frozen ITSELF BASE checkpoint**, `--no_only_global --enrichment_space grab` for a GRAB experiment, and retain the Full GATE run's `topm_rank_space`/`topm_rank_lambda` policy in its config (or select `global` for global-space PRF). The rank policy can be `host_global`, `retrieval`, or `hybrid_global_grab`; only Top-K **selection** may use another/hybrid space. PRF aggregation and final scoring always use the same chosen `enrichment_space` embeddings. A GRAB or hybrid selection requires GRAB features; `--only_global` cannot be combined with them.
+For ITSELF, use its original frozen BASE checkpoint;
+`--no_only_global --enrichment_space grab` permits GRAB-space PRF with the configured
+`topm_rank_space` and `topm_rank_lambda` Top-K selection policy.
 
-V4 produces exactly two text-to-image rows: frozen `global` (or `grab`) and `global+uniform_prf` (or `grab+uniform_prf`). The JSON includes both rows' `R1`, `R5`, `R10`, `mAP`, `mINP`, plus direct `eval/prf_R1`, `eval/prf_R5`, `eval/prf_R10`, `eval/prf_mAP`, `eval/prf_mINP`, `eval/prf_top_k`, and `eval/prf_beta`. `--save_json`, `--results_file`, and `--output_eval_dir` remain supported. Select `top_k` and `beta` without tuning on the benchmark test split.
+**Task counts:** CLIP `--only_global` produces 12 rows: frozen `global`,
+plus `global+uniform_prf(lambda)` for 11 lambda values. ITSELF when
+`--no_only_global` produces 156 rows: 13 original BASE tasks plus 143
+PRF fusion tasks. Each has R@1, R@5, R@10, mAP, and mINP.
+
+**JSON:** `best_task`, `best_R1`, `eval/ablation_best_lambda`, and
+`eval/ablation_best_*` correspond to the best R@1 **fused PRF** task.
+`eval/prf_R1`, `eval/prf_R5`, `eval/prf_R10`, `eval/prf_mAP`, and
+`eval/prf_mINP` always preserve **pure PRF at lambda=1**, not the selected
+fusion task. `eval/prf_top_k` and `eval/prf_beta` are retained.
+`--save_json`, `--results_file`, and `--output_eval_dir` are unchanged.
+
+**Experimental validity:** The current Main GATE evaluator selects the best
+lambda by R@1 on the evaluated split. If this is the test split, treat best
+lambda as a test-set oracle; for paper performance, select lambda on a
+validation split and hold it fixed for test evaluation.
 
 ## Checkpoint and reporting rules
 
@@ -138,7 +163,7 @@ V4 produces exactly two text-to-image rows: frozen `global` (or `grab`) and `glo
 - `test.py --save_json` writes an `inference_control` block and metrics `eval/control_*`, plus QE hyperparameters where relevant.
 - Report paired **R@1 and mAP**, and multiple V2 seeds. QueryOnly should be trained with the Full GATE budget, not compared to a differently tuned Full run.
 - **No claim that V2 provides a capacity-matched causal test**: that is the role of V1. V3 tests generic gallery feedback vs a learned GATE mechanism, not setting-level novelty.
-- To avoid changing the current manuscript's protocol implicitly, this patch does not modify checkpoint selection or the existing evaluator's final lambda sweep for Main/V1/V2/V3; only V4 deliberately bypasses that sweep.
+- V4 now reuses the existing Main GATE lambda-fusion evaluator; Main/V1/V2/V3 paths remain unchanged.
 
 ## Sanity checks
 
@@ -148,4 +173,4 @@ python -m unittest discover -s tests -p "test_gate_controls.py" -v
 python -m unittest discover -s tests -v
 ```
 
-V1: `model.target_enricher` has exactly the same parameter-key/shape inventory as Full, and `enrich_only(q, ..., None)` must be invariant to gallery changes. V2: identical seed gives identical permutation; gallery retrieval embeddings and PIDs remain unmodified. V3: QE with `--qe_alpha 0` must recover base similarity scores for the matching feature space. V4: `--prf_beta 0` recovers the frozen baseline; Top-K aggregation is uniform; only full-gallery PRF scores are reported, even if the baseline wins.
+V1: `model.target_enricher` has exactly the same parameter-key/shape inventory as Full, and `enrich_only(q, ..., None)` must be invariant to gallery changes. V2: identical seed gives identical permutation; gallery retrieval embeddings and PIDs remain unmodified. V3: QE with `--qe_alpha 0` must recover base similarity scores for the matching feature space. V4: `--prf_beta 0` recovers the baseline before fusion; Top-K aggregation is uniform; pure PRF is reported at lambda=1 and the full fusion grid is evaluated.
