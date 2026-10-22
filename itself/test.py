@@ -212,6 +212,8 @@ def _ensure_inference_defaults(args, config_file, config_keys=None):
     _set_if_not_present(args, "qe_alpha", 0.5)
     _set_if_not_present(args, "qe_temperature", 0.05)
     _set_if_not_present(args, "qe_top_m", None)
+    _set_if_not_present(args, "prf_top_k", 64)
+    _set_if_not_present(args, "prf_beta", 0.5)
     _set_if_not_present(args, "enrichment_space", "global")
     _set_if_not_present(args, "pretrain_choice", "ViT-B/16")
     _set_if_not_present(args, "img_size", (384, 128))
@@ -252,6 +254,8 @@ def _apply_cli_overrides(args, cli_args, config_file, checkpoint, eval_dir):
         "qe_alpha",
         "qe_temperature",
         "qe_top_m",
+        "prf_top_k",
+        "prf_beta",
     ):
         value = getattr(cli_args, name, None)
         if value is not None:
@@ -468,6 +472,10 @@ def main():
             "qe_top_m": args.qe_top_m,
         },
     }
+
+    if args.eval_baseline == "uniform_prf":
+        results["inference_control"]["prf_top_k"] = args.prf_top_k
+        results["inference_control"]["prf_beta"] = args.prf_beta
 
     source_check_metrics = None
     if run_source_check:

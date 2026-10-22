@@ -7,7 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from model.enrichment.enricher import TargetPrototypeEnricher
-from utils.gallery_controls import shuffle_gallery_evidence, similarity_weighted_qe_scores
+from utils.gallery_controls import (
+    shuffle_gallery_evidence, similarity_weighted_qe_scores, uniform_prf_scores,
+)
 
 
 def _args(variant):
@@ -127,6 +129,61 @@ class QEControlTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             similarity_weighted_qe_scores(q, g, alternative_ranks,
                                           top_m=1, temperature=0.)
+
+
+class UniformPRFControlTest(unittest.TestCase):
+    def setUp(self):
+        self.q = torch.tensor([[1., 0., 0.], [0., 1., 0.]])
+        self.g = torch.tensor([
+            [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [-1., 0., 0.]
+        ])
+        self.ranks = F.normalize(self.q, dim=1) @ F.normalize(self.g, dim=1).t()
+
+    def test_beta_zero_matches_frozen_baseline(self):
+        scores = uniform_prf_scores(self.q, self.g, self.ranks, top_k=2, beta=0)
+        torch.testing.assert_close(scores, self.ranks, rtol=0, atol=1e-6)
+
+    def test_uniform_mean_uses_rank_policy_and_full_gallery(self):
+        # Selection is intentionally different from q@g.T. No rank-score weights.
+        ranks = torch.tensor([[1., 100., 99., -100.]])
+        scores = uniform_prf_scores(self.q[:1], self.g, ranks, top_k=2, beta=1)
+        selected_mean = (self.g[1] + self.g[2]) / 2
+        expected_q = F.normalize(self.q[:1] + selected_mean, dim=1)
+        torch.testing.assert_close(scores, expected_q @ self.g.t())
+        self.assertEqual(tuple(scores.shape), (1, len(self.g)))
+        self.assertNotEqual(scores[0, 0].item(), scores[0, 1].item())
+
+    def test_determinism_and_batching(self):
+        a = uniform_prf_scores(self.q, self.g, self.ranks, top_k=3,
+                               beta=0.5, query_batch_size=1)
+        b = uniform_prf_scores(self.q, self.g, self.ranks, top_k=3,
+                               beta=0.5, query_batch_size=2)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_rejects_invalid_parameters_and_shapes(self):
+        for bad_top_k, bad_beta in ((0, 0.5), (-2, 0.5), (2, -0.1),
+                                    (2, float("nan"))):
+            with self.assertRaises(ValueError):
+                uniform_prf_scores(self.q, self.g, self.ranks,
+                                   top_k=bad_top_k, beta=bad_beta)
+        with self.assertRaises(ValueError):
+            uniform_prf_scores(self.q, self.g, torch.zeros(1, 4))
+        with self.assertRaises(ValueError):
+            uniform_prf_scores(self.q, torch.zeros(4, 2), self.ranks)
+
+    def test_no_pid_or_identity_labels_in_signature(self):
+        import inspect
+        params = set(inspect.signature(uniform_prf_scores).parameters)
+        self.assertEqual(
+            params,
+            {"query_features", "gallery_features", "rank_scores",
+             "top_k", "beta", "query_batch_size"},
+        )
+        # Identity labels are never passed to the PRF implementation.
+        self.assertTrue(torch.equal(
+            uniform_prf_scores(self.q, self.g, self.ranks),
+            uniform_prf_scores(self.q, self.g, self.ranks),
+        ))
 
 
 if __name__ == "__main__":

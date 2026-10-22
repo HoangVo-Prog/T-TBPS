@@ -1,5 +1,7 @@
 """Label-free inference controls for GATE (no test-time optimization)."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -82,4 +84,43 @@ def similarity_weighted_qe_scores(query_features, gallery_features, rank_scores,
         enriched = F.normalize(q[start:stop].to(g.device) + float(alpha) * context,
                                p=2, dim=-1)
         outputs.append((enriched @ g.t()).cpu())
+    return torch.cat(outputs, dim=0)
+
+
+@torch.no_grad()
+def uniform_prf_scores(query_features, gallery_features, rank_scores,
+                       top_k=64, beta=0.5, query_batch_size=64):
+    """Uniform Rocchio PRF in one frozen query/gallery feature space.
+
+    rank_scores controls *only* Top-K selection (global, GRAB, or hybrid).
+    Query refinement and full-gallery scoring use matching text/image
+    embeddings. No identity labels, learned weights, or score fusion.
+    """
+    if query_features.ndim != 2 or gallery_features.ndim != 2:
+        raise ValueError("PRF features must have shape [N, D]")
+    nq, dim = query_features.shape
+    ng, gallery_dim = gallery_features.shape
+    if nq == 0 or ng == 0 or dim != gallery_dim:
+        raise ValueError("PRF requires nonempty compatible text/image features")
+    if tuple(rank_scores.shape) != (nq, ng):
+        raise ValueError("rank_scores must have shape [num_queries, num_gallery]")
+    if int(top_k) <= 0 or int(query_batch_size) <= 0:
+        raise ValueError("top_k and query_batch_size must be positive")
+    if not math.isfinite(float(beta)) or float(beta) < 0:
+        raise ValueError("PRF beta must be finite and nonnegative")
+
+    q = F.normalize(query_features.float(), p=2, dim=-1)
+    g = F.normalize(gallery_features.float(), p=2, dim=-1)
+    k = min(int(top_k), ng)
+    outputs = []
+    for start in range(0, nq, int(query_batch_size)):
+        stop = min(start + int(query_batch_size), nq)
+        indices = rank_scores[start:stop].topk(k, dim=1, sorted=True).indices
+        evidence = g[indices.to(g.device)]
+        context = evidence.mean(dim=1)
+        refined = F.normalize(
+            q[start:stop].to(g.device) + float(beta) * context,
+            p=2, dim=-1,
+        )
+        outputs.append((refined @ g.t()).cpu())
     return torch.cat(outputs, dim=0)

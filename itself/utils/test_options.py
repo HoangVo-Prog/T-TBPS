@@ -105,7 +105,7 @@ def get_test_args():
                         default=None, help="keep or permute cached gallery evidence")
     parser.add_argument("--evidence_seed", type=int, default=None,
                         help="fixed seed for one permutation per gallery")
-    parser.add_argument("--eval_baseline", choices=("none", "similarity_qe"),
+    parser.add_argument("--eval_baseline", choices=("none", "similarity_qe", "uniform_prf"),
                         default=None, help="optional train-free gallery feedback baseline")
     parser.add_argument("--qe_alpha", type=float, default=None,
                         help="QE context strength (nonnegative)")
@@ -113,6 +113,10 @@ def get_test_args():
                         help="QE softmax temperature (positive)")
     parser.add_argument("--qe_top_m", type=int, default=None,
                         help="QE evidence count; default host top_m")
+    parser.add_argument("--prf_top_k", type=int, default=64,
+                        help="uniform Rocchio PRF evidence count")
+    parser.add_argument("--prf_beta", type=float, default=0.5,
+                        help="uniform Rocchio PRF context strength (nonnegative)")
 
     parser.add_argument(
         "--output_eval_dir",

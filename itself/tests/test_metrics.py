@@ -268,6 +268,64 @@ def _legacy_full_table(module, img_loader, txt_loader, args, model):
     return rows, best_task, float(best_row[1])
 
 
+class UniformPRFEvaluatorTests(unittest.TestCase):
+    def test_reports_prf_even_when_baseline_wins_without_fusion(self):
+        _ensure_prettytable_importable()
+        from utils.test_metrics import Evaluator
+
+        q = torch.tensor([[1., 0.]])
+        g = torch.tensor([[1., 0.]] + [[-0.4, 0.9165151]] * 9)
+        qids = torch.tensor([0])
+        gids = torch.tensor([0] + [1] * 9)
+        args = SimpleNamespace(
+            only_global=True, target_enrichment=False, evidence_control="none",
+            eval_baseline="uniform_prf", enrichment_space="global",
+            topm_rank_space="host_global", prf_top_k=10, prf_beta=10.,
+            eval_log_interval=0,
+        )
+        evaluator = Evaluator(None, None, args)
+        evaluator._compute_text_branches = lambda model, include_grab: (
+            q, None, qids, [1])
+        evaluator._compute_image_branches = lambda model, include_grab, include_target_cache: (
+            g, None, gids, None)
+        result = evaluator.eval(None)
+
+        self.assertEqual(evaluator.last_best_task, "global+uniform_prf")
+        self.assertEqual(result, evaluator.last_metrics["eval/prf_R1"])
+        self.assertGreater(evaluator.last_metrics["eval/global-t2i/R1"], result)
+        self.assertNotIn("eval/ablation_best_lambda", evaluator.last_metrics)
+        self.assertEqual(
+            len([k for k in evaluator.last_metrics if k.endswith("/mAP")]), 2
+        )
+
+    def test_grab_hybrid_ranking_and_direct_grab_output(self):
+        _ensure_prettytable_importable()
+        from utils.test_metrics import Evaluator
+
+        host_q = torch.tensor([[1., 0.]])
+        host_g = torch.tensor([[1., 0.]] + [[0., 1.]] * 9)
+        grab_q = torch.tensor([[0., 1.]])
+        grab_g = torch.tensor([[1., 0.]] + [[0., 1.]] * 9)
+        qids = torch.tensor([0])
+        gids = torch.tensor([1] + [0] * 9)
+        args = SimpleNamespace(
+            only_global=False, target_enrichment=False, evidence_control="none",
+            eval_baseline="uniform_prf", enrichment_space="grab",
+            topm_rank_space="hybrid_global_grab", topm_rank_lambda=0.8,
+            prf_top_k=1, prf_beta=2., eval_log_interval=0,
+        )
+        evaluator = Evaluator(None, None, args)
+        evaluator._compute_text_branches = lambda model, include_grab: (
+            host_q, grab_q, qids, [1])
+        evaluator._compute_image_branches = lambda model, include_grab, include_target_cache: (
+            host_g, grab_g, gids, None)
+        top1 = evaluator.eval(None)
+        self.assertEqual(evaluator.last_best_task, "grab+uniform_prf")
+        self.assertEqual(top1, evaluator.last_metrics["eval/prf_R1"])
+        self.assertLess(top1, evaluator.last_metrics["eval/grab-t2i/R1"])
+        self.assertNotIn("eval/ablation_best_lambda", evaluator.last_metrics)
+
+
 class RetrievalMetricTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

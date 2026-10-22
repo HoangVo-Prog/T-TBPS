@@ -132,7 +132,7 @@ def _clear_cuda_cache_if_available():
 
 
 from utils.gallery_controls import (
-    shuffle_gallery_evidence, similarity_weighted_qe_scores,
+    shuffle_gallery_evidence, similarity_weighted_qe_scores, uniform_prf_scores,
 )
 
 
@@ -766,7 +766,7 @@ class Evaluator:
         eval_baseline = getattr(self.args, "eval_baseline", "none")
         if evidence_control not in ("none", "shuffle"):
             raise ValueError("Unknown evidence_control: {}".format(evidence_control))
-        if eval_baseline not in ("none", "similarity_qe"):
+        if eval_baseline not in ("none", "similarity_qe", "uniform_prf"):
             raise ValueError("Unknown eval_baseline: {}".format(eval_baseline))
         if evidence_control == "shuffle" and not use_target_enrichment:
             raise ValueError("ShuffledEvidence requires --target_enrichment")
@@ -776,6 +776,10 @@ class Evaluator:
             raise ValueError("QE is a separate no-training baseline: use --no_target_enrichment")
         if eval_baseline == "similarity_qe" and evidence_control != "none":
             raise ValueError("QE and ShuffledEvidence are independent controls")
+        if eval_baseline == "uniform_prf" and use_target_enrichment:
+            raise ValueError("Uniform PRF requires --no_target_enrichment")
+        if eval_baseline == "uniform_prf" and evidence_control != "none":
+            raise ValueError("Uniform PRF and ShuffledEvidence are independent controls")
 
         self.logger.info("Starting evaluation feature extraction")
         include_grab = not self.args.only_global
@@ -805,7 +809,8 @@ class Evaluator:
             sims_grab = vq_feats @ vg_feats.t()
             self.logger.info("GRAB similarity matrix ready")
 
-        base_tasks = self._build_base_tasks(sims_global, sims_grab)
+        base_tasks = (self._build_base_tasks(sims_global, sims_grab)
+                      if eval_baseline != "uniform_prf" else [])
         sims_target = None
         target_tag = "proto"
         if eval_baseline == "similarity_qe":
@@ -843,6 +848,43 @@ class Evaluator:
                 temperature=getattr(self.args, "qe_temperature", 0.05),
             )
             self.logger.info("Computed similarity-weighted QE over full gallery")
+        if eval_baseline == "uniform_prf":
+            space = getattr(self.args, "enrichment_space", "global")
+            rank_space = getattr(self.args, "topm_rank_space", "host_global")
+            if space == "global":
+                prf_queries, prf_gallery = host_qfeats, host_gfeats
+                baseline_scores = sims_global
+            elif space == "grab":
+                if sims_grab is None:
+                    raise ValueError("GRAB-space PRF requires non-global ITSELF features")
+                prf_queries, prf_gallery = grab_qfeats, grab_gfeats
+                baseline_scores = sims_grab
+            else:
+                raise ValueError("PRF enrichment_space must be global or grab")
+
+            if rank_space == "host_global":
+                ranking_scores = sims_global
+            elif rank_space == "retrieval":
+                ranking_scores = sims_grab if space == "grab" else sims_global
+            elif rank_space == "hybrid_global_grab":
+                if sims_grab is None:
+                    raise ValueError("Hybrid Top-K PRF requires GRAB features")
+                lam = float(getattr(self.args, "topm_rank_lambda", 0.5))
+                ranking_scores = lam * sims_global + (1.0 - lam) * sims_grab
+            else:
+                raise ValueError("Unsupported topm_rank_space: {}".format(rank_space))
+
+            # Pure PRF: chosen-space frozen baseline and full-gallery refined
+            # scores only; never a score-fusion/lambda sweep.
+            base_tasks = [(space, baseline_scores)]
+            sims_target = uniform_prf_scores(
+                query_features=prf_queries,
+                gallery_features=prf_gallery,
+                rank_scores=ranking_scores,
+                top_k=getattr(self.args, "prf_top_k", 64),
+                beta=getattr(self.args, "prf_beta", 0.5),
+            )
+            self.logger.info("Computed uniform Rocchio PRF over full gallery")
         if use_target_enrichment:
             if evidence_control == "shuffle":
                 target_cache = shuffle_gallery_evidence(
@@ -879,17 +921,20 @@ class Evaluator:
         best_ablation_row = None
         t2i_metric_cache = {}
         i2t_metric_cache = {}
-        total_eval_tasks = len(base_tasks)
-        if sims_target is not None:
-            total_eval_tasks *= 1 + len(_prototype_lambdas())
+        if eval_baseline == "uniform_prf":
+            prf_task = "{}+uniform_prf".format(space)
+            eval_tasks = iter(base_tasks + [(prf_task, sims_target)])
+            total_eval_tasks = 2
+        else:
+            eval_tasks = self._iter_eval_tasks(base_tasks, sims_target, target_tag=target_tag)
+            total_eval_tasks = len(base_tasks)
+            if sims_target is not None:
+                total_eval_tasks *= 1 + len(_prototype_lambdas())
         self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
 
-        for task_idx, (key, sims) in enumerate(
-            self._iter_eval_tasks(base_tasks, sims_target, target_tag=target_tag),
-            1,
-        ):
+        for task_idx, (key, sims) in enumerate(eval_tasks, 1):
             t2i_name = "{}-t2i".format(key)
             cache_key = id(sims) if sims_target is not None and sims is sims_target else None
             if cache_key is not None and cache_key in t2i_metric_cache:
@@ -973,6 +1018,15 @@ class Evaluator:
         elif best_row is not None:
             top1 = float(best_row[1])
 
+        if eval_baseline == "uniform_prf":
+            # Report the actual PRF outcome, even when frozen baseline wins.
+            prf_row = rows_by_task[prf_task]
+            best_task = prf_task
+            top1 = float(prf_row[1])
+            for name, index in (("R1", 1), ("R5", 2), ("R10", 3),
+                                ("mAP", 4), ("mINP", 5)):
+                eval_metrics["eval/prf_{}".format(name)] = float(prf_row[index])
+
         target_key = "global+{}(1)".format(target_tag)
         if "global" in rows_by_task and target_key in rows_by_task:
             global_row = rows_by_task["global"]
@@ -1000,6 +1054,9 @@ class Evaluator:
         eval_metrics["eval/control_baseline"] = eval_baseline
         if evidence_control == "shuffle":
             eval_metrics["eval/control_seed"] = int(getattr(self.args, "evidence_seed", 1))
+        if eval_baseline == "uniform_prf":
+            eval_metrics["eval/prf_top_k"] = int(getattr(self.args, "prf_top_k", 64))
+            eval_metrics["eval/prf_beta"] = float(getattr(self.args, "prf_beta", 0.5))
         if eval_baseline == "similarity_qe":
             eval_metrics["eval/qe_alpha"] = float(getattr(self.args, "qe_alpha", 0.5))
             eval_metrics["eval/qe_temperature"] = float(getattr(self.args, "qe_temperature", 0.05))
